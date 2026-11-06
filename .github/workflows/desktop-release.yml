@@ -1,0 +1,171 @@
+# =============================================================================
+# Windows-Installer-Release für Pitwall Pro.
+#
+# DIESE DATEI gehört ins ÖFFENTLICHE Repo:
+#   Simulaite-Engineering/pitwall-desktop-releases
+# unter .github/workflows/desktop-release.yml
+#
+# Auslöser: ausschließlich workflow_dispatch (Forgejo release-desktop via
+# GH_DESKTOP_DISPATCH). Kein push-/PR-Trigger.
+#
+# Secrets (im Download-Repo):
+#   PITWALL_SOURCE_READ_TOKEN – Contents: Read auf Simulaite-Engineering/Pitwall-Pro
+#
+# Token-Rollen (nicht vermischen):
+#   BACKUP_PAT           → nur Mirror-Update (Forgejo Nightly / Sync)
+#   GH_DESKTOP_DISPATCH  → nur Actions dispatch auf dieses Repo (Forgejo)
+#   PITWALL_SOURCE_READ_TOKEN → nur Checkout hier
+# =============================================================================
+name: Desktop Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Quell-Tag (desktop-v<version>)'
+        required: true
+        type: string
+      source_commit:
+        description: 'Voller 40-stelliger Commit-SHA'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-windows-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-msi:
+    name: Build Windows MSI
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_TAG" in
+            desktop-v*) : ;;
+            *) echo "::error::source_tag muss desktop-v* sein"; exit 1 ;;
+          esac
+          case "$SOURCE_COMMIT" in
+            ''|*[!0-9a-f]*) echo "::error::source_commit ist kein Hex-SHA"; exit 1 ;;
+          esac
+          [ "${#SOURCE_COMMIT}" -eq 40 ] || { echo "::error::source_commit muss 40 Zeichen haben"; exit 1; }
+          VERSION="${SOURCE_TAG#desktop-v}"
+          echo "PRODUCT_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "inputs_ok tag=$SOURCE_TAG commit=$SOURCE_COMMIT version=$VERSION"
+
+      - name: Checkout private source mirror (read-only token)
+        uses: actions/checkout@v4
+        with:
+          repository: Simulaite-Engineering/Pitwall-Pro
+          ref: ${{ inputs.source_commit }}
+          token: ${{ secrets.PITWALL_SOURCE_READ_TOKEN }}
+          fetch-depth: 0
+
+      - name: Verify tag matches commit (fail-closed)
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          TAG_COMMIT="$(git rev-list -n1 "$SOURCE_TAG")"
+          HEAD="$(git rev-parse HEAD)"
+          [ "$HEAD" = "$SOURCE_COMMIT" ] || {
+            echo "::error::Checkout-HEAD $HEAD != source_commit $SOURCE_COMMIT"; exit 1; }
+          [ "$TAG_COMMIT" = "$SOURCE_COMMIT" ] || {
+            echo "::error::Tag $SOURCE_TAG → $TAG_COMMIT, erwartet $SOURCE_COMMIT"; exit 1; }
+          echo "tag_commit_match=PASS"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          choco install wixtoolset -y --no-progress
+          $wix = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          if (-not (Test-Path $wix)) {
+            $wix = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $wix) { throw "WiX bin path not found" }
+          echo "$wix" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "wix_bin=$wix"
+
+      - name: Build MSI (Dioxus + HUD, not Tauri)
+        shell: pwsh
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "msi-out"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & pwsh -File .\scripts\windows\build_desktop_msi.ps1 `
+            -SourceTag $env:SOURCE_TAG `
+            -SourceCommit $env:SOURCE_COMMIT `
+            -RepoRoot (Get-Location).Path `
+            -OutDir $out `
+            -ProductVersion $env:PRODUCT_VERSION
+          echo "MSI_OUT=$out" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Idempotent release publish (no silent overwrite)
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MSI="$(ls "$MSI_OUT"/PitwallPro-*-x64.msi | head -n1)"
+          SHA_FILE="${MSI}.sha256"
+          MANIFEST="$MSI_OUT/release-manifest.json"
+          [ -f "$MSI" ] && [ -f "$SHA_FILE" ] && [ -f "$MANIFEST" ]
+          NEW_SHA="$(awk '{print $1}' "$SHA_FILE")"
+          ASSET_NAME="$(basename "$MSI")"
+
+          # Existierendes Release?
+          if gh release view "$SOURCE_TAG" >/dev/null 2>&1; then
+            echo "release_exists=true tag=$SOURCE_TAG"
+            EXISTING="$(gh release download "$SOURCE_TAG" -p "$ASSET_NAME.sha256" -O - 2>/dev/null || true)"
+            if [ -n "$EXISTING" ]; then
+              OLD_SHA="$(printf '%s' "$EXISTING" | awk '{print $1}')"
+              if [ "$OLD_SHA" = "$NEW_SHA" ]; then
+                echo "release_idempotent=PASS digest_unchanged=$NEW_SHA"
+                echo "github_windows_build=PASS (idempotent)"
+                exit 0
+              fi
+              echo "::error::Release $SOURCE_TAG existiert mit abweichendem Digest old=$OLD_SHA new=$NEW_SHA – fail-closed, kein Überschreiben."
+              exit 1
+            fi
+            echo "::error::Release $SOURCE_TAG existiert ohne erwartetes SHA-Asset – fail-closed."
+            exit 1
+          fi
+
+          NOTES="$(python3 - <<PY
+print("""## Pitwall Pro Desktop (Windows)
+
+- Version: ${SOURCE_TAG#desktop-v}
+- Source tag: $SOURCE_TAG
+- Source commit: $SOURCE_COMMIT
+- Installer SHA-256: $NEW_SHA
+
+Packaging: WiX MSI (Dioxus Desktop + HUD sidecar). No internal hosts or secrets.
+""")
+PY
+)"
+          gh release create "$SOURCE_TAG" \
+            --title "Pitwall Pro $SOURCE_TAG (Windows)" \
+            --notes "$NOTES" \
+            "$MSI" "$SHA_FILE" "$MANIFEST"
+          echo "github_windows_build=PASS release=$SOURCE_TAG sha256=$NEW_SHA"
