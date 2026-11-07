@@ -152,18 +152,15 @@ jobs:
             exit 1
           fi
 
-          NOTES="$(python3 - <<PY
-print("""## Pitwall Pro Desktop (Windows)
-
-- Version: ${SOURCE_TAG#desktop-v}
-- Source tag: $SOURCE_TAG
-- Source commit: $SOURCE_COMMIT
-- Installer SHA-256: $NEW_SHA
-
-Packaging: WiX MSI (Dioxus Desktop + HUD sidecar). No internal hosts or secrets.
-""")
-PY
-)"
+          NOTES="$(printf '%s\n' \
+            '## Pitwall Pro Desktop (Windows)' \
+            '' \
+            "- Version: ${SOURCE_TAG#desktop-v}" \
+            "- Source tag: $SOURCE_TAG" \
+            "- Source commit: $SOURCE_COMMIT" \
+            "- Installer SHA-256: $NEW_SHA" \
+            '' \
+            'Packaging: WiX MSI (Dioxus Desktop + HUD sidecar). No internal hosts or secrets.')"
           gh release create "$SOURCE_TAG" \
             --title "Pitwall Pro $SOURCE_TAG (Windows)" \
             --notes "$NOTES" \
